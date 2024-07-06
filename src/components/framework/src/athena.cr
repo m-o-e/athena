@@ -176,6 +176,8 @@ module Athena::Framework
   #
   # Currently an implementation detail. In the future could be exposed to allow having separate "groups" of controllers that a `Server` instance handles.
   struct Server
+    @@inflight_requests = Atomic(Int32).new(0)
+
     def initialize(
       @port : Int32 = 3000,
       @host : String = "0.0.0.0",
@@ -184,6 +186,9 @@ module Athena::Framework
       prepend_handlers handlers : Array(HTTP::Handler) = [] of HTTP::Handler
     )
       handler_proc = HTTP::Handler::HandlerProc.new do |context|
+        # Track inflight requests
+        @@inflight_requests.add(1)
+
         # Reinitialize the container since keep-alive requests reuse the same fiber.
         Fiber.current.container = ADI::ServiceContainer.new
 
@@ -200,6 +205,8 @@ module Athena::Framework
 
         # Emit the terminate event now that the response has been sent.
         handler.terminate request, athena_response
+      ensure
+        @@inflight_requests.sub(1)
       end
 
       @server = if handlers.empty?
@@ -234,6 +241,25 @@ module Athena::Framework
       Log.info { %(Server has started and is listening at #{@ssl_context ? "https" : "http"}://#{@server.addresses.first}) }
 
       @server.listen
+      shutdown
+    end
+
+    private def shutdown
+      grace = ENV.fetch("SHUTDOWN_GRACE_PERIOD", "10").to_i
+      return if grace < 1
+
+      remaining = @@inflight_requests.get
+
+      (0..grace).each do |i|
+        remaining = @@inflight_requests.get
+        break if remaining == 0
+        Log.info { "Server is shutting down, waiting for #{remaining} inflight requests to finish (deadline in #{grace - i}s)" }
+        sleep 1
+      end
+
+      if remaining != 0
+        Log.info { "Aborting #{remaining} inflight requests" }
+      end
     end
   end
 end
